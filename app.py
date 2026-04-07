@@ -1,17 +1,13 @@
-import streamlit as st
 import os
 from dotenv import load_dotenv
 
-# ==============================
-# Load Environment Variables
-# ==============================
 load_dotenv()
 
 # ==============================
-# LangChain + Tools Imports
+# Imports
 # ==============================
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.messages import AnyMessage
 from typing_extensions import TypedDict
 from typing import Annotated
@@ -21,34 +17,25 @@ from langchain_community.tools.wikipedia.tool import WikipediaQueryRun
 from langchain_community.tools.tavily_search.tool import TavilySearchResults
 from langchain_community.utilities import ArxivAPIWrapper, WikipediaAPIWrapper
 
-# LangGraph
 from langgraph.graph import StateGraph, START
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 # ==============================
-# LangSmith (Tracing Optional)
-# ==============================
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
-os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
-os.environ["LANGCHAIN_PROJECT"] = "ScholarGraph"
-
-# ==============================
-# Initialize Tools (Improved)
+# Initialize Tools
 # ==============================
 
 arxiv = ArxivQueryRun(
     api_wrapper=ArxivAPIWrapper(
-        top_k_results=5,
-        doc_content_chars_max=1500,
+        top_k_results=3,
+        doc_content_chars_max=1200
     )
 )
 
 wiki = WikipediaQueryRun(
     api_wrapper=WikipediaAPIWrapper(
         top_k_results=2,
-        doc_content_chars_max=1000,
+        doc_content_chars_max=800
     )
 )
 
@@ -57,73 +44,41 @@ tavily = TavilySearchResults()
 tools = [arxiv, wiki, tavily]
 
 # ==============================
-# Initialize LLM (Upgraded)
+# LLM (ReAct-enabled)
 # ==============================
 
 llm = ChatGroq(
-    model="llama-3.3-70b-versatile",  # Strong tool calling
+    model="llama-3.3-70b-versatile",
     temperature=0
 )
 
+# 🔥 IMPORTANT: Enable tool calling
 llm_with_tools = llm.bind_tools(tools)
 
 # ==============================
-# State Schema
+# LangGraph State
 # ==============================
 
 class State(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
 
 # ==============================
-# Intent Detection (IMPORTANT)
-# ==============================
-
-def detect_intent(user_input: str):
-    text = user_input.lower()
-
-    if any(word in text for word in ["research paper", "paper", "arxiv", "journal"]):
-        return "arxiv"
-    elif any(word in text for word in ["what is", "define", "meaning"]):
-        return "wiki"
-    elif any(word in text for word in ["latest", "news", "recent", "update"]):
-        return "tavily"
-    else:
-        return "general"
-
-# ==============================
-# Chatbot Node (Improved)
+# Chatbot Node (Reasoning Step)
 # ==============================
 
 def chatbot(state: State):
-    user_message = state["messages"][-1].content
-    intent = detect_intent(user_message)
-
-    # 🔥 ROUTING LOGIC (Key Fix)
-    if intent == "arxiv":
-        result = arxiv.run(user_message)
-        return {"messages": [HumanMessage(content=result)]}
-
-    elif intent == "wiki":
-        result = wiki.run(user_message)
-        return {"messages": [HumanMessage(content=result)]}
-
-    elif intent == "tavily":
-        result = tavily.run(user_message)
-        return {"messages": [HumanMessage(content=result)]}
-
-    # 🔥 Default → LLM with tool support
     messages = [
-        SystemMessage(
-            content="""
+        SystemMessage(content="""
 You are ScholarGraph AI, a research assistant.
 
-Guidelines:
-- Use arXiv tool for research papers
-- Use Wikipedia for explanations
-- Use Tavily for current info
-- Be clear, structured, and helpful
-"""
-        )
+You must follow ReAct pattern:
+- Think step-by-step
+- Use tools when needed
+- Use arXiv for research papers
+- Use Wikipedia for concepts
+- Use Tavily for latest info
+- Continue reasoning until final answer
+""")
     ] + state["messages"]
 
     response = llm_with_tools.invoke(messages)
@@ -131,67 +86,74 @@ Guidelines:
     return {"messages": [response]}
 
 # ==============================
-# Build Graph
+# Build ReAct Graph
 # ==============================
 
 builder = StateGraph(State)
 
+# Nodes
 builder.add_node("chatbot", chatbot)
 builder.add_node("tools", ToolNode(tools))
 
+# Flow
 builder.add_edge(START, "chatbot")
 
+# 🔥 THIS ENABLES REACT LOOP
 builder.add_conditional_edges(
     "chatbot",
-    tools_condition,
+    tools_condition   # decides: call tool OR finish
 )
 
 builder.add_edge("tools", "chatbot")
 
+# Compile graph
 graph = builder.compile()
 
 # ==============================
-# Streamlit UI
+# Memory Helper (Last 5 Messages)
 # ==============================
 
-st.set_page_config(page_title="ScholarGraph AI", layout="wide")
-st.title("📚 ScholarGraph – Multi-Tool Research Assistant")
+def get_last_messages(chat_history, k=5):
+    messages = []
+    for msg in chat_history[-k:]:
+        if msg["role"] == "user":
+            messages.append(HumanMessage(content=msg["content"]))
+        else:
+            messages.append(AIMessage(content=msg["content"]))
+    return messages
 
-# Session Memory
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+# ==============================
+# CLI Chat Loop (Test)
+# ==============================
 
-# Display Chat
-for msg in st.session_state.chat_history:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+if __name__ == "__main__":
+    chat_history = []
 
-# User Input
-user_input = st.chat_input("Ask anything (research, papers, live search)...")
+    print("ScholarGraph ReAct Agent (type 'exit' to quit)\n")
 
-if user_input:
+    while True:
+        user_input = input("You: ")
 
-    # Show user message
-    st.chat_message("user").markdown(user_input)
-    st.session_state.chat_history.append(
-        {"role": "user", "content": user_input}
-    )
+        if user_input.lower() == "exit":
+            break
 
-    # Invoke Graph
-    response = graph.invoke({
-        "messages": [HumanMessage(content=user_input)]
-    })
+        # Store user message
+        chat_history.append({"role": "user", "content": user_input})
 
-    # Debug (Optional)
-    # for msg in response["messages"]:
-    #     print(msg)
+        # Get last 5 messages
+        messages = get_last_messages(chat_history, 5)
 
-    final_message = response["messages"][-1].content
+        # Add current input
+        messages.append(HumanMessage(content=user_input))
 
-    # Show assistant response
-    with st.chat_message("assistant"):
-        st.markdown(final_message)
+        # Run ReAct agent
+        response = graph.invoke({
+            "messages": messages
+        })
 
-    st.session_state.chat_history.append(
-        {"role": "assistant", "content": final_message}
-    )
+        final_output = response["messages"][-1].content
+
+        print("\nAI:", final_output, "\n")
+
+        # Store AI response
+        chat_history.append({"role": "assistant", "content": final_output})
